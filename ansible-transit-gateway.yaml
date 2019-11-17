@@ -1,0 +1,92 @@
+- hosts: localhost
+  vars:
+    region: "us-east-1"
+    first_stack: "stack1"
+    second_stack: "stack2"
+  tasks:
+    - name: "accessing first stack facts"
+      ec2_vpc_net_facts:
+        filters:
+          "tag:aws:cloudformation:stack-name": "{{ first_stack }}"
+      register: vpc_first_fact
+    - name: "accessing second stack facts"
+      ec2_vpc_net_facts:
+        filters:
+          "tag:aws:cloudformation:stack-name": "{{ second_stack }}"
+      register: vpc_second_fact
+    - name: "access first stack subnet"
+      ec2_vpc_subnet_facts:
+        filters:
+          vpc-id: "{{ vpc_first_fact[0].id }}"
+          "tag:Name": "First Subnet"
+      register: subnet_first_fact
+    - name: "access second stack subnet"
+      ec2_vpc_subnet_facts:
+        filters:
+          vpc-id: "{{ vpc_second_fact[0].id }}"
+          "tag:Name": "Second Subnet"
+      register: subnet_second_fact
+    - name: "Create transit gateway"
+      shell: |
+        aws ec2 create-transit-gateway --description tgw \
+        --options=AmazonSideASN=64444, AutoAcceptSharedAttachments=disable, \ 
+        DefaultTableRouteAssociation=enable, DefaultRouteTablePropagtion=enable, \
+        VpnEcmpSupport=enable, DnsSupport=disable \
+        --tag-specifications 'ResourceType=transit-gateway, Tags=[{Key=Name, Value=tgw}]'
+      register: tgw
+      until: tgw.stdout.find("TransitGatewayId") != -1
+      retries: 20
+      delay: 40
+    - name: "Get transit gateway id and save to variable"
+      shell: |
+        aws ec2 describe-transit-gateways -filters Name=tag:Name, Values=tgw Name=state,Values=pending --query TansitGateways[0].TransitGatewayId --output text
+      register: tgwid
+    - name: "Create gateway attachment for first VPC"
+      shell: |
+        aws ec2 create-transit-gateway-vpc-attachment \
+        --transit-gateway-id "{{ tgwid.stdout }}" \
+        --vpc-id "{{ vpc_first_fact.vpcs[0].id }}"
+        --subnet-id "{{ subnet_first_fact.subnets[0].subnet_id }}"
+        --tag-specifications 'ResourceType=transit-gateway-attachment, Tags=[{Key=Name, Value=tgw-attachment-first}]'
+      register: firstattachment
+      until: firstattachment.stdout.find("TransitGatewayAttachmentId") != -1 
+      retries: 20
+      delay: 40
+    - name: "Create gateway attachment for second VPC"
+      shell: |
+        aws ec2 create-transit-gateway-vpc-attachment \
+        --transit-gateway-id "{{ tgwid.stdout }}" \
+        --vpc-id "{{ vpc_second_fact.vpcs[0].id }}"
+        --subnet-id "{{ subnet_second_fact.subnets[0].subnet_id }}"
+        --tag-specifications 'ResourceType=transit-gateway-attachment, Tags=[{Key=Name, Value=tgw-attachment-second}]'
+      register: firstattachment
+      until: firstattachment.stdout.find("TransitGatewayAttachmentId") != -1 
+      retries: 20
+      delay: 40
+    - name: "Create route table for first for second communication"
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc_first_fact.vpcs[0].id }}"
+        region: "{{ region }}"
+        tags:
+          Name: "route-table-first"
+    - name: "Create route table for second for first communication"
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc_second_fact.vpcs[0].id }}"
+        region: "{{ region }}"
+        tags:
+          Name: "route-table-second"
+    - name: "Get first route table id"
+      shell: |
+        aws ec2-describe-route-tables --filters Name=tag:Name,Values=route-table-first --query RouteTables[0].RouteTableId --output text
+      register: firstroutetableid
+    - name: "Get second route table id"
+      shell: |
+        aws ec2-describe-route-tables --filters Name=tag:Name,Values=route-table-second --query RouteTables[0].RouteTableId --output text
+      register: secondroutetableid
+    - name: "Add route to first table"
+      shell: |
+        aws ec2 create-route --route-table-id "{{ firstroutetableid.stdout }}" --destination-cidr-block "{{ subnet_first_fact.subnets[0].cidr_block }}" --gateway-id "{{ tgwid.stdout }}"
+    - name: "Add route to second table"
+      shell: |
+        aws ec2 create-route --route-table-id "{{ secondroutetableid.stdout }}" --destination-cidr-block "{{ subnet_second_fact.subnets[0].cidr_block }}" --gateway-id "{{ tgwid.stdout }}"     
+
